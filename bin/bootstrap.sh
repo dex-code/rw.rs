@@ -18,11 +18,12 @@ if [ -z "${RWRS_SKIP_APT+x}" ]; then
     apt-get -y --allow-releaseinfo-change update
     DEBIAN_FRONTEND=noninteractive \
     apt install -yq build-essential libtool libtool-bin sudo quota net-tools \
-        curl git zsh vim emacs nano mle screen tmux irssi weechat inspircd \
+        curl git zsh vim emacs nano mle screen tmux irssi weechat \
         subversion libxml2-dev libpcre3-dev strace gdb socat sqlite3 \
         libsqlite3-dev fish mosh stow re2c bison libssl-dev pkg-config \
         zlib1g-dev libreadline-dev libgd-dev libfreetype6-dev libwebp-dev \
-        libonig-dev lua5.3 liblua5.3-dev libffi-dev
+        libonig-dev lua5.3 liblua5.3-dev libffi-dev bind9-dnsutils cmake \
+        ca-certificates debian-archive-keyring snapd rsync unattended-upgrades
     systemctl daemon-reexec
     logger -t $log_ns "ran apt updates"
 fi
@@ -56,34 +57,12 @@ if ! diff "$rwrs_root/etc/sshd_config" /etc/ssh/sshd_config &>/dev/null; then
 fi
 
 # configure restricted user slice
-if ! diff "$rwrs_root/etc/user-restricted.slice.conf" \
-          "$restricted_slice_dir/user-restricted.slice.conf" &>/dev/null
-then
-    mkdir -p $restricted_slice_dir
-    cp -vf "$rwrs_root/etc/user-restricted.slice.conf" $restricted_slice_dir
-    systemctl daemon-reload
-    logger -t $log_ns "updated user-restricted.slice.conf"
-fi
+$rwrs_root/bin/update_restricted_slice_conf.sh
 
 # configure cron
 if ! diff "$rwrs_root/etc/cron" /etc/cron.d/rw-rs &>/dev/null; then
     cp -vf "$rwrs_root/etc/cron" /etc/cron.d/rw-rs
     logger -t $log_ns "updated cron"
-fi
-
-# configure ircd
-if ! diff <(grep -v pass "$rwrs_root/etc/inspircd.conf") \
-          <(grep -v pass /etc/inspircd/inspircd.conf) &>/dev/null
-then
-    cp -vf "$rwrs_root/etc/inspircd.conf" /etc/inspircd/inspircd.conf
-    ircd_pass=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 24)
-    sed -i "s/@ircdpasshere@/$ircd_pass/g" /etc/inspircd/inspircd.conf
-    touch /etc/inspircd/inspircd.motd
-    chown -R irc:irc /etc/inspircd/
-    chmod 700 /etc/inspircd/
-    chmod 600 /etc/inspircd/inspircd.conf
-    systemctl restart inspircd
-    logger -t $log_ns "updated inspircd.conf"
 fi
 
 # build apache
@@ -99,14 +78,18 @@ then
     pushd "httpd-${httpd_version}"
     svn co http://svn.apache.org/repos/asf/apr/apr/trunk srclib/apr
     ./buildconf
-    ./configure --prefix=$httpd_root --with-included-apr --with-libxml2=/usr \
+    CFLAGS='-I /usr/include/libxml2/' \
+        ./configure --prefix=$httpd_root --with-included-apr --with-libxml2=/usr \
         --enable-mods-shared=all --enable-mpms-shared=all --enable-suexec \
-        --enable-proxy --enable-cgi --enable-userdir --enable-debugger-mode
+        --enable-proxy --enable-cgi --enable-userdir --enable-debugger-mode \
+        --enable-ssl
     make
     make install
     popd
-    groupadd apache
-    useradd -r -d $httpd_root -s /usr/sbin/nologin -g apache apache
+    if ! getent passwd apache >/dev/null; then
+        groupadd apache
+        useradd -r -d $httpd_root -s /usr/sbin/nologin -g apache apache
+    fi
     mkdir -p $httpd_var_dir
     chown apache:apache $httpd_var_dir
     popd
@@ -126,7 +109,8 @@ if ! { command -v php && [ $(php -r 'echo PHP_VERSION;') = "$php_version" ]; }; 
          --without-pear --with-zlib --enable-soap --enable-bcmath \
          --enable-mbstring --enable-opcache --enable-debug \
          --enable-gd --with-webp --with-jpeg --with-freetype \
-         --with-apxs2=$httpd_root/bin/apxs --with-ffi --disable-session
+         --with-apxs2=$httpd_root/bin/apxs --with-ffi --disable-session \
+         --disable-fileinfo
     make
     make install
     popd
@@ -140,6 +124,35 @@ if [ ! -h "$php_ini_path" ]; then
     logger -t $log_ns "symlinked php_ini_path"
 fi
 
+# install ssl certs (not in test env)
+if [ -z "${RWRS_TEST+x}" ]; then
+    # install certbot
+    if ! command -v certbot &>/dev/null; then
+        snap install core
+        snap refresh core
+        snap install --classic certbot
+        ln -sfv /snap/bin/certbot /usr/bin/certbot
+    fi
+
+    # request cert if not present or expired
+    if $rwrs_root/bin/certbot_is_expired.sh; then
+        logger -t $log_ns "cert expired"
+        certbot certonly \
+            --non-interactive \
+            --manual \
+            --agree-tos \
+            --email=rwrs@protonmail.com \
+            --domains=rw.rs \
+            --preferred-challenges http \
+            --manual-auth-hook=$rwrs_root/bin/certbot_hook.sh \
+            --manual-cleanup-hook=$rwrs_root/bin/certbot_clean.sh
+        ln -sfv /etc/letsencrypt/live/rw.rs/fullchain.pem $cert_full
+        ln -sfv /etc/letsencrypt/live/rw.rs/privkey.pem   $cert_priv
+        systemctl restart httpd
+        logger -t $log_ns "cert updated"
+    fi
+fi
+
 # configure apache
 if ! diff "$rwrs_root/etc/httpd.service" /etc/systemd/system/httpd.service || \
    ! diff "$rwrs_root/etc/httpd.conf" $httpd_root/conf/httpd.conf
@@ -147,7 +160,7 @@ then
     cp -vf "$rwrs_root/etc/httpd.service" /etc/systemd/system/
     cp -vf "$rwrs_root/etc/httpd.conf" $httpd_root/conf/
     rm -rf $htdocs_root
-    ln -s "$rwrs_root/htdocs" $htdocs_root
+    ln -sfv "$rwrs_root/htdocs" $htdocs_root
     systemctl daemon-reload
     if systemctl is-active httpd; then
         systemctl reload httpd
@@ -198,9 +211,26 @@ if ! id -u robot 2>/dev/null; then
 fi
 
 # add robot sudoers entry
-if ! grep -q robot_as_root /etc/sudoers; then
-    echo -e '\n\nrobot ALL=(root:root) NOPASSWD: /opt/rw.rs/bin/robot_as_root.sh' >>/etc/sudoers
+if ! [ -f /etc/sudoers.d/rwrs_robot ]; then
+    echo 'robot ALL=(root:root) NOPASSWD: /opt/rw.rs/bin/robot_as_root.sh' \
+        >/etc/sudoers.d/rwrs_robot
     logger -t $log_ns "created robot sudoer rule"
+fi
+
+# create mosh group
+groupadd -f mosh
+
+# install rwrs_mosh_server
+if ! diff "$rwrs_root/bin/rwrs_mosh_server.sh" /usr/bin/rwrs_mosh_server &>/dev/null; then
+    cp -vf "$rwrs_root/bin/rwrs_mosh_server.sh" /usr/bin/rwrs_mosh_server
+    logger -t $log_ns "updated rwrs_mosh_server"
+fi
+
+# add mosh sudoers entry
+if ! [ -f /etc/sudoers.d/mosh ]; then
+    echo '%mosh ALL=(root:root) NOPASSWD: /usr/bin/rwrs_mosh_server ""' \
+        >/etc/sudoers.d/mosh
+    logger -t $log_ns "created mosh sudoer rule"
 fi
 
 # manually configured items:
